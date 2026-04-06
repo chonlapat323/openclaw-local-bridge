@@ -6,12 +6,25 @@ function getLineAccessToken() {
   if (!token) {
     throw new Error('Missing LINE_CHANNEL_ACCESS_TOKEN');
   }
+
+  console.log('[local-bridge] line-token-check', {
+    exists: true,
+    length: token.length,
+    prefix: token.slice(0, 8),
+  });
+
   return token;
 }
 
 async function pushLineMessage(to, text) {
   const accessToken = getLineAccessToken();
   if (!to) throw new Error('Missing LINE push target');
+
+  console.log('[local-bridge] line-push-request', {
+    to,
+    textPreview: String(text || '').slice(0, 120),
+    textLength: String(text || '').length,
+  });
 
   const response = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
@@ -25,12 +38,23 @@ async function pushLineMessage(to, text) {
     }),
   });
 
+  const raw = await response.text();
+
+  console.log('[local-bridge] line-push-response', {
+    ok: response.ok,
+    status: response.status,
+    preview: raw.slice(0, 300),
+  });
+
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`LINE push failed (${response.status}): ${body}`);
+    throw new Error(`LINE push failed (${response.status}): ${raw}`);
   }
 
-  return response.json().catch(() => ({ ok: true }));
+  try {
+    return raw ? JSON.parse(raw) : { ok: true };
+  } catch {
+    return { ok: true, raw };
+  }
 }
 
 const app = express();
@@ -71,6 +95,15 @@ async function callOpenClaw(body) {
   const timeout = setTimeout(() => controller.abort(), openclawTimeoutMs);
 
   try {
+    console.log('[local-bridge] openclaw-request', {
+      url: `${openclawBaseUrl}/v1/chat/completions`,
+      sessionKey: body.sessionKey,
+      model: openclawModel,
+      timeoutMs: openclawTimeoutMs,
+      hasGatewayToken: Boolean(openclawGatewayToken),
+      messagePreview: String(body.message || '').slice(0, 160),
+    });
+
     const response = await fetch(`${openclawBaseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -93,6 +126,13 @@ async function callOpenClaw(body) {
     });
 
     const text = await response.text();
+
+    console.log('[local-bridge] openclaw-response', {
+      ok: response.ok,
+      status: response.status,
+      preview: text.slice(0, 400),
+    });
+
     if (!response.ok) {
       throw new Error(`OpenClaw failed (${response.status}): ${text}`);
     }
@@ -123,6 +163,7 @@ async function callOpenClaw(body) {
 
 app.get('/health', async (req, res) => {
   try {
+    console.log('[local-bridge] health-check', { openclawBaseUrl });
     const response = await fetch(`${openclawBaseUrl}/health`);
     const health = await response.json().catch(() => ({ ok: false }));
 
@@ -242,6 +283,7 @@ app.post('/line-event-async', (req, res) => {
         eventId,
         pushTarget,
         message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
       });
 
       try {
@@ -257,6 +299,7 @@ app.post('/line-event-async', (req, res) => {
           eventId,
           pushTarget,
           message: pushError instanceof Error ? pushError.message : String(pushError),
+          stack: pushError instanceof Error ? pushError.stack : undefined,
         });
       }
     }
