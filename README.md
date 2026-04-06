@@ -62,6 +62,18 @@ npm install
 npm run dev
 ```
 
+## Run with PM2
+
+สร้าง `.env` ให้เรียบร้อยก่อน แล้วใช้ไฟล์ `ecosystem.config.cjs`:
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 status
+pm2 logs openclaw-local-bridge
+pm2 save
+pm2 startup
+```
+
 ## Connect to Vercel
 
 ตั้งค่าในโปรเจกต์ `linewebhook` ฝั่ง Vercel:
