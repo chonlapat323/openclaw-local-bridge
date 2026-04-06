@@ -5,8 +5,10 @@ app.use(express.json({ limit: '1mb' }));
 
 const port = Number(process.env.PORT || 3001);
 const internalApiToken = process.env.INTERNAL_API_TOKEN;
-const downstreamUrl = process.env.OPENCLAW_LOCAL_URL;
-const downstreamTimeoutMs = Number(process.env.OPENCLAW_LOCAL_TIMEOUT_MS || 15000);
+const openclawBaseUrl = (process.env.OPENCLAW_BASE_URL || 'http://127.0.0.1:18789').replace(/\/$/, '');
+const openclawGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+const openclawModel = process.env.OPENCLAW_MODEL || 'openclaw/default';
+const openclawTimeoutMs = Number(process.env.OPENCLAW_TIMEOUT_MS || 20000);
 const seenEvents = new Map();
 const SEEN_TTL_MS = 10 * 60 * 1000;
 
@@ -27,58 +29,85 @@ function isAuthorized(req) {
   return header === `Bearer ${internalApiToken}`;
 }
 
-function buildFallbackReply(body) {
-  const source = body?.metadata?.chatType || 'chat';
-  const incoming = String(body?.message || '').split('\n').find((line) => line.startsWith('User message: '));
-  const userText = incoming ? incoming.replace('User message: ', '').trim() : '';
-
-  if (!userText) {
-    return `รับข้อความจาก ${source} แล้ว แต่ local bridge ยังไม่ได้ต่อเข้ากับ OpenClaw จริง`;
-  }
-
-  return [
-    'รับข้อความแล้วครับ ✨',
-    'ตอนนี้ local bridge ทำงานแล้ว แต่ยังต้องต่อ adapter เข้า OpenClaw local อีกชั้นหนึ่ง',
-    `ข้อความล่าสุด: ${userText}`,
-  ].join('\n');
-}
-
-async function callDownstream(body) {
-  if (!downstreamUrl) {
-    return { reply: buildFallbackReply(body), mode: 'fallback' };
+async function callOpenClaw(body) {
+  if (!openclawGatewayToken) {
+    throw new Error('Missing OPENCLAW_GATEWAY_TOKEN');
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), downstreamTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), openclawTimeoutMs);
 
   try {
-    const response = await fetch(downstreamUrl, {
+    const response = await fetch(`${openclawBaseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(internalApiToken ? { Authorization: `Bearer ${internalApiToken}` } : {}),
+        Authorization: `Bearer ${openclawGatewayToken}`,
+        'x-openclaw-session-key': body.sessionKey,
+        'x-openclaw-message-channel': 'line',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model: openclawModel,
+        messages: [
+          {
+            role: 'user',
+            content: String(body.message || ''),
+          },
+        ],
+        user: body.sessionKey,
+      }),
       signal: controller.signal,
     });
 
+    const text = await response.text();
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Downstream failed (${response.status}): ${text}`);
+      throw new Error(`OpenClaw failed (${response.status}): ${text}`);
     }
 
-    return await response.json();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`OpenClaw returned non-JSON response: ${text.slice(0, 500)}`);
+    }
+
+    const reply =
+      json?.choices?.[0]?.message?.content ||
+      json?.output_text ||
+      json?.reply ||
+      json?.text ||
+      json?.message;
+
+    if (!reply) {
+      throw new Error(`OpenClaw returned no reply field: ${text.slice(0, 1000)}`);
+    }
+
+    return { reply: String(reply), raw: json };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'openclaw-local-bridge',
-    downstreamConfigured: Boolean(downstreamUrl),
-  });
+app.get('/health', async (req, res) => {
+  try {
+    const response = await fetch(`${openclawBaseUrl}/health`);
+    const health = await response.json().catch(() => ({ ok: false }));
+
+    res.json({
+      ok: true,
+      service: 'openclaw-local-bridge',
+      openclawBaseUrl,
+      openclawReachable: response.ok,
+      openclawHealth: health,
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      service: 'openclaw-local-bridge',
+      openclawBaseUrl,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.post('/line-event', async (req, res) => {
@@ -111,19 +140,14 @@ app.post('/line-event', async (req, res) => {
       chatId: body?.metadata?.chatId,
     });
 
-    const result = await callDownstream(body);
-    const reply = result?.reply || result?.text || result?.message;
-
-    if (!reply) {
-      return res.status(502).json({ ok: false, error: 'downstream returned no reply' });
-    }
+    const result = await callOpenClaw(body);
 
     return res.json({
       ok: true,
-      reply: String(reply),
+      reply: result.reply,
       sessionKey,
       eventId,
-      forwarded: Boolean(downstreamUrl),
+      forwarded: true,
     });
   } catch (error) {
     console.error('[local-bridge] failed', {
