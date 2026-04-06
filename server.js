@@ -1,6 +1,38 @@
 import 'dotenv/config';
 import express from 'express';
 
+function getLineAccessToken() {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) {
+    throw new Error('Missing LINE_CHANNEL_ACCESS_TOKEN');
+  }
+  return token;
+}
+
+async function pushLineMessage(to, text) {
+  const accessToken = getLineAccessToken();
+  if (!to) throw new Error('Missing LINE push target');
+
+  const response = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      to,
+      messages: [{ type: 'text', text: text || 'โอ๊ะ มีอะไรบางอย่างไม่ครบ เดี๋ยวลองใหม่อีกทีนะ' }],
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`LINE push failed (${response.status}): ${body}`);
+  }
+
+  return response.json().catch(() => ({ ok: true }));
+}
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
@@ -162,6 +194,73 @@ app.post('/line-event', async (req, res) => {
       error: error instanceof Error ? error.message : String(error),
     });
   }
+});
+
+app.post('/line-event-async', (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  const body = req.body || {};
+  const sessionKey = body?.sessionKey;
+  const message = body?.message;
+  const eventId = body?.metadata?.eventId;
+  const pushTarget = body?.metadata?.pushTarget;
+
+  if (!sessionKey || !message || !pushTarget) {
+    return res.status(400).json({ ok: false, error: 'missing sessionKey, message, or metadata.pushTarget' });
+  }
+
+  if (eventId && seenEvents.has(eventId)) {
+    return res.json({ ok: true, deduped: true, accepted: true });
+  }
+
+  if (eventId) {
+    seenEvents.set(eventId, Date.now());
+  }
+
+  console.log('[local-bridge] accepted-async', {
+    sessionKey,
+    eventId,
+    pushTarget,
+  });
+
+  res.status(202).json({ ok: true, accepted: true, sessionKey, eventId });
+
+  setImmediate(async () => {
+    try {
+      const result = await callOpenClaw(body);
+      await pushLineMessage(pushTarget, String(result.reply).slice(0, 5000));
+      console.log('[local-bridge] async-push-ok', {
+        sessionKey,
+        eventId,
+        pushTarget,
+      });
+    } catch (error) {
+      console.error('[local-bridge] async-failed', {
+        sessionKey,
+        eventId,
+        pushTarget,
+        message: error instanceof Error ? error.message : String(error),
+      });
+
+      try {
+        await pushLineMessage(pushTarget, 'ตอนนี้แจ่มใสติดอะไรบางอย่างอยู่ ขออีกแป๊บนะ');
+        console.log('[local-bridge] async-fallback-push-ok', {
+          sessionKey,
+          eventId,
+          pushTarget,
+        });
+      } catch (pushError) {
+        console.error('[local-bridge] async-fallback-push-failed', {
+          sessionKey,
+          eventId,
+          pushTarget,
+          message: pushError instanceof Error ? pushError.message : String(pushError),
+        });
+      }
+    }
+  });
 });
 
 app.listen(port, () => {
